@@ -9,6 +9,21 @@
     <script defer src="sketch.js"></script>
   </head>
   <body>
-    <div id="boot-message">Haz clic una vez para iniciar camara y serial.</div>
+    <div id="boot-message">
+      <div id="boot-panel">
+        <p id="boot-title">Elige la camara y arranca la visual.</p>
+        <p id="boot-steps">1. Buscar camaras  2. Elegir una  3. Iniciar visual</p>
+        <div id="boot-controls">
+          <select id="camera-select" aria-label="Seleccionar camara">
+            <option value="">Primero busca las camaras disponibles</option>
+          </select>
+          <div id="boot-actions">
+            <button id="refresh-cameras" type="button">Buscar camaras</button>
+            <button id="start-system" type="button">Iniciar visual</button>
+          </div>
+        </div>
+        <p id="boot-status">Si usas una app en el iPhone, abrela primero. El serial ya no es obligatorio: si existe un puerto autorizado se conectara solo.</p>
+      </div>
+    </div>
   </body>
 </html>

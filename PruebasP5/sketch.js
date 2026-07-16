@@ -4,53 +4,65 @@ const NEUTRAL_PH = 7;
 const SERIAL_BAUD = 9600;
 const VIDEO_W = 640;
 const VIDEO_H = 480;
+const CAMERA_STORAGE_KEY = "arduino-ph-camera-id";
 const PROCESS_SCALE = 0.56;
 const PROCESS_W = Math.floor(VIDEO_W * PROCESS_SCALE);
 const PROCESS_H = Math.floor(VIDEO_H * PROCESS_SCALE);
-const GRID_STEP = 2;
+const GRID_STEP = 1;
 const NOISE_SCALE = 0.014;
 const CHAOS_MAX = 4;
 const PH_SMOOTHING = 0.08;
 const PIXEL_SAMPLE_EVERY = 2;
-const FOREGROUND_THRESHOLD = 0.18;
-const FOREGROUND_STRONG_THRESHOLD = 0.42;
+const FOREGROUND_THRESHOLD = 0.19;
+const FOREGROUND_STRONG_THRESHOLD = 0.5;
 const DEPTH_STRENGTH = 72;
 const BODY_FILL_STRENGTH = 2.0;
 const BODY_NEIGHBOR_BLEND = 0.55;
+const BODY_COHERENCE_BOOST = 0.32;
+const BODY_DIAGONAL_BLEND = 0.7;
+const BODY_MIN_COHERENCE = 0.24;
+const BODY_ISOLATION_REJECTION = 0.28;
 const EDGE_STRENGTH = 0.18;
 const MOTION_STRENGTH = 0.12;
 const BACKGROUND_WARMUP_FRAMES = 45;
-const BACKGROUND_LEARN_RATE = 0.15;
-const BACKGROUND_HOLD_THRESHOLD = 0.05;
+const BACKGROUND_LEARN_RATE = 0.08;
+const BACKGROUND_HOLD_THRESHOLD = 0.035;
 
 let capture;
 let captureReady = false;
 let bootMessageEl;
+let bootStatusEl;
+let cameraSelectEl;
+let startButtonEl;
+let refreshButtonEl;
 let processBuffer;
 let processPixels = null;
 let pointGrid = [];
+let brightnessCache = null;
 let drawW = 0;
 let drawH = 0;
 let backgroundBrightness = null;
 let backgroundWarmupFrame = 0;
 let backgroundReady = false;
 let bgLayer;
+let activeCameraLabel = "";
+let availableCameras = [];
 
 const PH_COLORS = [
-  [175, 1, 2],    // pH 1 (Baterías)
-  [224, 0, 0],    // pH 2 (Limón)
-  [253, 1, 0],    // pH 3 (Vinagre)
-  [255, 125, 5],  // pH 4 (Tomate)
-  [251, 174, 58], // pH 5 (Café)
-  [255, 219, 1],  // pH 6 (Leche)
-  [202, 222, 101],// pH 7 (Agua)
-  [169, 202, 1],  // pH 8 (Sangre)
-  [1, 171, 0],    // pH 9 (Clara de huevo)
-  [63, 130, 93],  // pH 10 (Bicarbonato)
-  [157, 227, 237],// pH 11 (Amoniaco)
-  [11, 175, 210], // pH 12 (Jabón)
-  [74, 114, 186], // pH 13 (Cloro)
-  [97, 63, 150]   // pH 14 (Destapacaños)
+  [175, 1, 2],
+  [224, 0, 0],
+  [253, 1, 0],
+  [255, 125, 5],
+  [251, 174, 58],
+  [255, 219, 1],
+  [202, 222, 101],
+  [169, 202, 1],
+  [1, 171, 0],
+  [63, 130, 93],
+  [157, 227, 237],
+  [11, 175, 210],
+  [74, 114, 186],
+  [97, 63, 150]
 ];
 
 let currentPh = NEUTRAL_PH;
@@ -79,13 +91,18 @@ function setup() {
   processBuffer = createGraphics(PROCESS_W, PROCESS_H);
   processBuffer.pixelDensity(1);
   backgroundBrightness = new Float32Array(PROCESS_W * PROCESS_H);
+  brightnessCache = new Float32Array(PROCESS_W * PROCESS_H);
   updateDrawMetrics();
   bgLayer = createGraphics(width, height);
   rebuildPointGrid();
 
   bootMessageEl = document.getElementById("boot-message");
+  bootStatusEl = document.getElementById("boot-status");
+  cameraSelectEl = document.getElementById("camera-select");
+  startButtonEl = document.getElementById("start-system");
+  refreshButtonEl = document.getElementById("refresh-cameras");
 
-  registerInteractionHandlers();
+  initializeBootUi();
   registerSerialListeners();
   void prepareAuthorizedPorts();
 }
@@ -94,27 +111,20 @@ function draw() {
   currentPh = lerp(currentPh, targetPh, PH_SMOOTHING);
 
   if (!captureReady) {
-    // Aún esperando la cámara, no hacer nada.
     return;
   }
 
-  // --- LÓGICA DE CAOS INVERTIDO ---
   const chaosNorm = pow(constrain(map(currentPh, PH_MIN, PH_MAX, 1, 0), 0, 1), 2.0);
 
-  // --- LÓGICA DE FONDO DINÁMICO ---
-  // El nivel de desenfoque y la visibilidad del fondo dependen del pH.
-  const bgBlur = map(chaosNorm, 0, 1, 2, 20); // Menos blur a mayor pH.
-  const bgAlpha = map(chaosNorm, 0, 1, 220, 0); // Más visible a mayor pH.
+  const bgBlur = map(chaosNorm, 0, 1, 2, 20);
+  const bgAlpha = map(chaosNorm, 0, 1, 220, 0);
 
-  // Dibuja la imagen de la cámara en la capa de fondo con el desenfoque calculado.
   bgLayer.push();
   bgLayer.translate(width, 0);
   bgLayer.scale(-1, 1);
   bgLayer.image(capture, 0, 0, width, height);
   bgLayer.pop();
   bgLayer.filter(BLUR, bgBlur);
-
-  // Dibuja el fondo 2D con la transparencia calculada.
   push();
   translate(-width / 2, -height / 2);
   tint(255, bgAlpha);
@@ -138,21 +148,25 @@ function draw() {
   const now = millis() * 0.001;
   const timeA = now * noiseDrift;
   const timeB = now * (noiseDrift * 0.82 + 0.05) + 12.0;
-  const timeC = now * 1.2; // Una segunda capa de ruido más rápida y constante
+  const timeC = now * 1.2;
 
-  // --- PROPUESTA 2: PULSO DE ENERGÍA ---
-  const pulseFrequency = lerp(1.0, 12.0, chaosNorm); // La velocidad del pulso depende del caos
-  const pulseSignal = (sin(now * pulseFrequency) + 1) / 2; // Onda sinusoidal de 0 a 1
-  const pulseWeight = lerp(0, 2.5, chaosNorm) * pulseSignal; // Amplitud del pulso de tamaño
-  const pointWeight = lerp(2.8, 4.5, chaosNorm) + pulseWeight;
+  const pulseFrequency = lerp(1.0, 12.0, chaosNorm);
+  const pulseSignal = (sin(now * pulseFrequency) + 1) / 2;
+  const pulseWeight = lerp(0, 2.5, chaosNorm) * pulseSignal;
+  const pointWeight = lerp(3.1, 4.8, chaosNorm) + pulseWeight;
 
   strokeWeight(pointWeight);
   beginShape(POINTS);
 
   for (const pointData of pointGrid) {
-    // El código de detección de figura se mueve a una función para mayor claridad
-    const pointState = getPointState(pointData);
-    if (pointState.fillBody <= 0.025) {
+    let pointState;
+    if (frameCount % PIXEL_SAMPLE_EVERY === 0) {
+      pointState = getPointState(pointData);
+      pointData.lastState = pointState; // Guardar el estado para el siguiente frame.
+    } else {
+      pointState = pointData.lastState; // Reutilizar el estado del frame anterior.
+    }
+    if (pointState.fillBody <= 0.01) {
       continue;
     }
 
@@ -167,11 +181,10 @@ function draw() {
     const offsetY = (noiseB * 1.05 - noiseA * 0.35 + noiseC * 0.45) * chaosAmplitude * chaosFactor * 0.8;
     const offsetZ = (noiseA + noiseB) * chaosAmplitude * 0.32 * chaosFactor;
 
-    // --- LÓGICA DE COLOR CON DEGRADADO ---
-    const phFloor = floor(currentPh);
-    const lerpAmt = currentPh - phFloor;
-    const index1 = constrain(phFloor - 1, 0, PH_COLORS.length - 1);
-    const index2 = constrain(ceil(currentPh) - 1, 0, PH_COLORS.length - 1);
+    const phClamped = constrain(currentPh, 1, PH_COLORS.length);
+    const index1 = constrain(floor(phClamped) - 1, 0, PH_COLORS.length - 1);
+    const index2 = constrain(ceil(phClamped) - 1, 0, PH_COLORS.length - 1);
+    const lerpAmt = phClamped - floor(phClamped);
     const r = lerp(PH_COLORS[index1][0], PH_COLORS[index2][0], lerpAmt);
     const g = lerp(PH_COLORS[index1][1], PH_COLORS[index2][1], lerpAmt);
     const b = lerp(PH_COLORS[index1][2], PH_COLORS[index2][2], lerpAmt);
@@ -200,14 +213,34 @@ function windowResized() {
   rebuildPointGrid();
 }
 
-function registerInteractionHandlers() {
-  window.addEventListener("pointerdown", handleStartInteraction);
-  window.addEventListener("keydown", handleStartInteraction);
+function initializeBootUi() {
+  refreshButtonEl?.addEventListener("click", () => {
+    void loadCameraOptions({ requestPermission: true });
+  });
+
+  startButtonEl?.addEventListener("click", () => {
+    void beginExperience();
+  });
+
+  cameraSelectEl?.addEventListener("change", () => {
+    const selectedCameraId = cameraSelectEl.value;
+    if (selectedCameraId) {
+      localStorage.setItem(CAMERA_STORAGE_KEY, selectedCameraId);
+      const selectedCamera = availableCameras.find((camera) => camera.deviceId === selectedCameraId);
+      if (selectedCamera?.label) {
+        setBootMessage(`Camara seleccionada: ${selectedCamera.label}`);
+      }
+    }
+  });
+
+  if (startButtonEl) {
+    startButtonEl.disabled = true;
+  }
 }
 
 function registerSerialListeners() {
   if (!("serial" in navigator)) {
-    setBootMessage("Abre este sketch en Chrome o Edge y haz clic para iniciar.");
+    console.info("Web Serial no esta disponible. La visual iniciara sin pH en vivo.");
     return;
   }
 
@@ -225,10 +258,8 @@ async function prepareAuthorizedPorts() {
     authorizedPorts = await navigator.serial.getPorts();
     if (authorizedPorts.length > 0) {
       await openSerialPort(authorizedPorts[0]);
-      if (captureReady) {
-        hideBootMessage();
-      } else {
-        setBootMessage("Haz clic una vez para activar la camara.");
+      if (!captureReady) {
+        setBootMessage("Camara lista. Se encontro un serial autorizado y se conectara solo al iniciar.");
       }
     }
   } catch (error) {
@@ -236,7 +267,7 @@ async function prepareAuthorizedPorts() {
   }
 }
 
-function handleStartInteraction() {
+async function beginExperience() {
   if (startInProgress) {
     return;
   }
@@ -245,30 +276,14 @@ function handleStartInteraction() {
     return;
   }
 
-  void beginExperience();
-}
-
-async function beginExperience() {
   startInProgress = true;
 
   try {
-    if (!serialPort) {
-      if (!("serial" in navigator)) {
-        throw new Error("Web Serial no esta disponible aqui. Usa Chrome o Edge.");
-      }
-
-      if (authorizedPorts.length > 0) {
-        await openSerialPort(authorizedPorts[0]);
-      } else {
-        const requestedPort = await navigator.serial.requestPort();
-        authorizedPorts = [requestedPort];
-        await openSerialPort(requestedPort);
-      }
-    }
-
     if (!captureReady) {
       await setupCamera();
     }
+
+    await tryAutoConnectSerial();
 
     startupComplete = true;
     hideBootMessage();
@@ -286,12 +301,8 @@ function formatStartError(error) {
     return "No se pudo iniciar. Haz clic para reintentar.";
   }
 
-  if (error.name === "NotFoundError") {
-    return "No se eligio un puerto serial. Haz clic para reintentar.";
-  }
-
   if (error.name === "NotAllowedError" || error.name === "SecurityError") {
-    return "Permiso denegado. Da acceso a camara y serial, luego haz clic otra vez.";
+    return "Permiso denegado. Da acceso a la camara y vuelve a intentar.";
   }
 
   return error.message || "No se pudo iniciar. Haz clic para reintentar.";
@@ -302,15 +313,13 @@ async function setupCamera() {
     return;
   }
 
+  const videoConstraints = await getSelectedVideoConstraints();
+
   capture = await new Promise((resolve, reject) => {
     const video = createCapture(
       {
         audio: false,
-        video: {
-          width: { ideal: VIDEO_W },
-          height: { ideal: VIDEO_H },
-          frameRate: { ideal: 30, max: 30 }
-        }
+        video: videoConstraints
       },
       () => resolve(video)
     );
@@ -324,7 +333,114 @@ async function setupCamera() {
 
   capture.size(VIDEO_W, VIDEO_H);
   capture.hide();
+  resetBackgroundModel();
   captureReady = true;
+}
+
+async function getSelectedVideoConstraints() {
+  const fallbackConstraints = {
+    width: { ideal: VIDEO_W },
+    height: { ideal: VIDEO_H },
+    frameRate: { ideal: 30, max: 30 }
+  };
+
+  if (!navigator.mediaDevices?.enumerateDevices || !navigator.mediaDevices?.getUserMedia) {
+    activeCameraLabel = "default";
+    return fallbackConstraints;
+  }
+
+  if (!availableCameras.length) {
+    await loadCameraOptions({ requestPermission: true });
+  }
+
+  const savedCameraId = cameraSelectEl?.value || localStorage.getItem(CAMERA_STORAGE_KEY) || "";
+  const selectedCamera = availableCameras.find((device) => device.deviceId === savedCameraId) || availableCameras[0];
+
+  if (selectedCamera) {
+    activeCameraLabel = selectedCamera.label || "Camara seleccionada";
+    localStorage.setItem(CAMERA_STORAGE_KEY, selectedCamera.deviceId);
+    return {
+      ...fallbackConstraints,
+      deviceId: { exact: selectedCamera.deviceId }
+    };
+  }
+
+  activeCameraLabel = "default";
+  return fallbackConstraints;
+}
+
+async function loadCameraOptions({ requestPermission } = { requestPermission: true }) {
+  if (!navigator.mediaDevices?.enumerateDevices || !navigator.mediaDevices?.getUserMedia) {
+    setBootMessage("Este navegador no permite elegir camaras.");
+    return;
+  }
+
+  let tempStream = null;
+
+  try {
+    if (requestPermission) {
+      tempStream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: false
+      });
+    }
+
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    availableCameras = devices.filter((device) => device.kind === "videoinput");
+    populateCameraSelect();
+
+    if (!availableCameras.length) {
+      setBootMessage("No se encontraron camaras disponibles.");
+      return;
+    }
+
+    setBootMessage("Camara lista. Elige una opcion y pulsa Iniciar visual.");
+  } catch (error) {
+    console.error(error);
+    setBootMessage("No se pudieron cargar las camaras. Revisa permisos y vuelve a intentar.");
+  } finally {
+    if (tempStream) {
+      for (const track of tempStream.getTracks()) {
+        track.stop();
+      }
+    }
+  }
+}
+
+function populateCameraSelect() {
+  if (!cameraSelectEl) {
+    return;
+  }
+
+  const savedCameraId = localStorage.getItem(CAMERA_STORAGE_KEY) || "";
+  cameraSelectEl.innerHTML = "";
+
+  for (let index = 0; index < availableCameras.length; index += 1) {
+    const camera = availableCameras[index];
+    const option = document.createElement("option");
+    option.value = camera.deviceId;
+    option.textContent = camera.label || `Camara ${index + 1}`;
+    cameraSelectEl.appendChild(option);
+  }
+
+  if (!availableCameras.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "No se encontraron camaras";
+    cameraSelectEl.appendChild(option);
+    cameraSelectEl.disabled = true;
+    if (startButtonEl) {
+      startButtonEl.disabled = true;
+    }
+    return;
+  }
+
+  const savedCameraExists = availableCameras.some((camera) => camera.deviceId === savedCameraId);
+  cameraSelectEl.value = savedCameraExists ? savedCameraId : availableCameras[0].deviceId;
+  cameraSelectEl.disabled = false;
+  if (startButtonEl) {
+    startButtonEl.disabled = false;
+  }
 }
 
 function refreshProcessFrame() {
@@ -364,16 +480,25 @@ function rebuildPointGrid() {
         pixelIndex: pixelNumber * 4,
         leftPixelNumber: max(x - GRID_STEP, 0) + y * PROCESS_W,
         upPixelNumber: x + max(y - GRID_STEP, 0) * PROCESS_W,
+        upLeftPixelNumber: max(x - GRID_STEP, 0) + max(y - GRID_STEP, 0) * PROCESS_W,
+        upRightPixelNumber: min(x + GRID_STEP, PROCESS_W - 1) + max(y - GRID_STEP, 0) * PROCESS_W,
         rightPixelNumber: min(x + GRID_STEP, PROCESS_W - 1) + y * PROCESS_W,
         downPixelNumber: x + min(y + GRID_STEP, PROCESS_H - 1) * PROCESS_W,
+        downLeftPixelNumber: max(x - GRID_STEP, 0) + min(y + GRID_STEP, PROCESS_H - 1) * PROCESS_W,
+        downRightPixelNumber: min(x + GRID_STEP, PROCESS_W - 1) + min(y + GRID_STEP, PROCESS_H - 1) * PROCESS_W,
         leftIndex: (max(x - GRID_STEP, 0) + y * PROCESS_W) * 4,
         upIndex: (x + max(y - GRID_STEP, 0) * PROCESS_W) * 4,
+        upLeftIndex: (max(x - GRID_STEP, 0) + max(y - GRID_STEP, 0) * PROCESS_W) * 4,
+        upRightIndex: (min(x + GRID_STEP, PROCESS_W - 1) + max(y - GRID_STEP, 0) * PROCESS_W) * 4,
         rightIndex: ((min(x + GRID_STEP, PROCESS_W - 1)) + y * PROCESS_W) * 4,
         downIndex: (x + min(y + GRID_STEP, PROCESS_H - 1) * PROCESS_W) * 4,
+        downLeftIndex: (max(x - GRID_STEP, 0) + min(y + GRID_STEP, PROCESS_H - 1) * PROCESS_W) * 4,
+        downRightIndex: (min(x + GRID_STEP, PROCESS_W - 1) + min(y + GRID_STEP, PROCESS_H - 1) * PROCESS_W) * 4,
         baseX: px,
         baseY: py,
         noiseX: x * NOISE_SCALE,
         noiseY: y * NOISE_SCALE,
+        lastState: { fillBody: 0, alpha: 0, depth: 0 },
         lastBrightness: 0,
         skipOdd: ((x / GRID_STEP + y / GRID_STEP) & 1) === 1
       });
@@ -381,44 +506,36 @@ function rebuildPointGrid() {
   }
 }
 
-function getBrightnessAt(index, fallbackBrightness) {
-  if (index < 0 || index + 2 >= processPixels.length) {
-    return fallbackBrightness;
+function updateBackgroundModel() {
+  if (frameCount % PIXEL_SAMPLE_EVERY === 0) {
+    for (let i = 0; i < processPixels.length / 4; i++) {
+      const pixelIndex = i * 4;
+      brightnessCache[i] =
+        processPixels[pixelIndex] * 0.299 +
+        processPixels[pixelIndex + 1] * 0.587 +
+        processPixels[pixelIndex + 2] * 0.114;
+    }
   }
 
-  return (
-    processPixels[index] * 0.299 +
-    processPixels[index + 1] * 0.587 +
-    processPixels[index + 2] * 0.114
-  );
-}
-
-function updateBackgroundModel() {
-  for (const pointData of pointGrid) {
-    const index = pointData.pixelIndex;
-    const pixelNumber = pointData.pixelNumber;
-    const brightness =
-      processPixels[index] * 0.299 +
-      processPixels[index + 1] * 0.587 +
-      processPixels[index + 2] * 0.114;
+  for (let i = 0; i < backgroundBrightness.length; i++) {
+    const brightness = brightnessCache[i];
+    if (isNaN(brightness)) continue;
 
     if (!backgroundReady) {
-      const current = backgroundBrightness[pixelNumber];
-      backgroundBrightness[pixelNumber] = current === 0
+      const current = backgroundBrightness[i];
+      backgroundBrightness[i] = current === 0
         ? brightness
         : lerp(current, brightness, 0.25);
       continue;
     }
 
-    // El fondo siempre se adapta un poco para evitar que se congele.
     let learnRate = BACKGROUND_LEARN_RATE * 0.1;
 
-    const foregroundSignal = abs(brightness - backgroundBrightness[pixelNumber]) / 255;
-    if (foregroundSignal < FOREGROUND_THRESHOLD) {
-      // Si no hay figura, se adapta mucho más rápido.
+    const foregroundSignal = abs(brightness - backgroundBrightness[i]) / 255;
+    if (foregroundSignal < BACKGROUND_HOLD_THRESHOLD) {
       learnRate = BACKGROUND_LEARN_RATE;
     }
-    backgroundBrightness[pixelNumber] = lerp(backgroundBrightness[pixelNumber], brightness, learnRate);
+    backgroundBrightness[i] = lerp(backgroundBrightness[i], brightness, learnRate);
   }
 
   if (!backgroundReady) {
@@ -427,6 +544,12 @@ function updateBackgroundModel() {
       backgroundReady = true;
     }
   }
+}
+
+function resetBackgroundModel() {
+  backgroundBrightness = new Float32Array(PROCESS_W * PROCESS_H);
+  backgroundWarmupFrame = 0;
+  backgroundReady = false;
 }
 
 async function openSerialPort(port) {
@@ -526,10 +649,6 @@ async function handleSerialDisconnect() {
     return;
   }
 
-  if (captureReady) {
-    setBootMessage("Serial desconectado. Reconectando...");
-  }
-
   await prepareAuthorizedPorts();
 
   if (!serialPort) {
@@ -552,16 +671,28 @@ function scheduleReconnect() {
       authorizedPorts = await navigator.serial.getPorts();
       if (authorizedPorts.length > 0) {
         await openSerialPort(authorizedPorts[0]);
-        if (captureReady) {
-          hideBootMessage();
-        } else {
-          setBootMessage("Haz clic una vez para activar la camara.");
-        }
       }
     } catch (error) {
       console.warn("No se pudo reintentar la conexion serial.", error);
     }
   }, 2500);
+}
+
+async function tryAutoConnectSerial() {
+  if (serialPort || serialOpening || !("serial" in navigator)) {
+    return;
+  }
+
+  try {
+    authorizedPorts = await navigator.serial.getPorts();
+    if (authorizedPorts.length > 0) {
+      await openSerialPort(authorizedPorts[0]);
+    } else {
+      console.info("No hay puertos seriales autorizados. La visual usara pH neutro hasta que exista uno.");
+    }
+  } catch (error) {
+    console.warn("No se pudo intentar la conexion serial automatica.", error);
+  }
 }
 
 function clearReconnectTimer() {
@@ -576,57 +707,90 @@ function hideBootMessage() {
 }
 
 function setBootMessage(message) {
-  if (bootMessageEl) {
-    bootMessageEl.textContent = message;
+  if (bootStatusEl) {
+    bootStatusEl.textContent = message;
   }
   document.body.classList.remove("running");
 }
 
-/**
- * Calcula el estado de un punto (figura, fondo, etc.) para el frame actual.
- * @param {object} pointData - Los datos del punto de la rejilla.
- * @returns {object} Un objeto con fillBody, alpha, y depth.
- */
 function getPointState(pointData) {
-  const index = pointData.pixelIndex;
-  const r = processPixels[index];
-  const g = processPixels[index + 1];
-  const b = processPixels[index + 2];
-
-  const brightness = r * 0.299 + g * 0.587 + b * 0.114;
+  const brightness = brightnessCache[pointData.pixelNumber];
   const bgBrightness = backgroundBrightness[pointData.pixelNumber];
-  const rightBrightness = getBrightnessAt(pointData.rightIndex, brightness);
-  const downBrightness = getBrightnessAt(pointData.downIndex, brightness);
-  const edge = ((abs(brightness - rightBrightness) + abs(brightness - downBrightness)) * 0.5) / 255;
-  const motion = abs(brightness - pointData.lastBrightness) / 255;
+
+  const leftBrightness = brightnessCache[pointData.leftPixelNumber];
+  const rightBrightness = brightnessCache[pointData.rightPixelNumber];
+  const upBrightness = brightnessCache[pointData.upPixelNumber];
+  const downBrightness = brightnessCache[pointData.downPixelNumber];
+  const upLeftBrightness = brightnessCache[pointData.upLeftPixelNumber];
+  const upRightBrightness = brightnessCache[pointData.upRightPixelNumber];
+  const downLeftBrightness = brightnessCache[pointData.downLeftPixelNumber];
+  const downRightBrightness = brightnessCache[pointData.downRightPixelNumber];
+
   const foreground = abs(brightness - bgBrightness) / 255;
-  const leftBrightness = getBrightnessAt(pointData.leftIndex, brightness);
-  const upBrightness = getBrightnessAt(pointData.upIndex, brightness);
-  const rightForeground = abs(rightBrightness - backgroundBrightness[pointData.rightPixelNumber]) / 255;
-  const downForeground = abs(downBrightness - backgroundBrightness[pointData.downPixelNumber]) / 255;
   const leftForeground = abs(leftBrightness - backgroundBrightness[pointData.leftPixelNumber]) / 255;
+  const rightForeground = abs(rightBrightness - backgroundBrightness[pointData.rightPixelNumber]) / 255;
   const upForeground = abs(upBrightness - backgroundBrightness[pointData.upPixelNumber]) / 255;
-  const neighborForeground =
-    (foreground + rightForeground + downForeground + leftForeground + upForeground) / 5;
-  const localForeground = max(
+  const downForeground = abs(downBrightness - backgroundBrightness[pointData.downPixelNumber]) / 255;
+  const upLeftForeground = abs(upLeftBrightness - backgroundBrightness[pointData.upLeftPixelNumber]) / 255;
+  const upRightForeground = abs(upRightBrightness - backgroundBrightness[pointData.upRightPixelNumber]) / 255;
+  const downLeftForeground = abs(downLeftBrightness - backgroundBrightness[pointData.downLeftPixelNumber]) / 255;
+  const downRightForeground = abs(downRightBrightness - backgroundBrightness[pointData.downRightPixelNumber]) / 255;
+
+  const samples = [
     foreground,
-    rightForeground,
-    downForeground,
     leftForeground,
-    upForeground
-  );
-  const amplifiedBody = pow(localForeground, 0.75) * 2.5;
-  const body = constrain(
-    map(amplifiedBody, FOREGROUND_THRESHOLD, FOREGROUND_STRONG_THRESHOLD, 0, 1),
+    rightForeground,
+    upForeground,
+    downForeground,
+    upLeftForeground,
+    upRightForeground,
+    downLeftForeground,
+    downRightForeground
+  ];
+
+  const localForeground = max(...samples);
+  const averageForeground = samples.reduce((sum, value) => sum + value, 0) / samples.length;
+  const cardinalForeground =
+    (foreground + leftForeground + rightForeground + upForeground + downForeground) / 5;
+  const diagonalForeground =
+    (upLeftForeground + upRightForeground + downLeftForeground + downRightForeground) / 4;
+  const neighborForeground = lerp(cardinalForeground, diagonalForeground, BODY_DIAGONAL_BLEND * 0.5);
+  const coherence = samples.filter((value) => value > FOREGROUND_THRESHOLD * 0.82).length / samples.length;
+  const strongCore = samples.filter((value) => value > FOREGROUND_THRESHOLD * 1.08).length / samples.length;
+
+  if (localForeground < FOREGROUND_THRESHOLD * 0.92) {
+    pointData.lastBrightness = brightness;
+    return { fillBody: 0, alpha: 0, depth: 0 };
+  }
+
+  if (coherence < BODY_MIN_COHERENCE && averageForeground < FOREGROUND_THRESHOLD * 0.95) {
+    pointData.lastBrightness = brightness;
+    return { fillBody: 0, alpha: 0, depth: 0 };
+  }
+
+  if (neighborForeground < FOREGROUND_THRESHOLD * BODY_ISOLATION_REJECTION && strongCore < 0.22) {
+    pointData.lastBrightness = brightness;
+    return { fillBody: 0, alpha: 0, depth: 0 };
+  }
+
+  const bodyMass = constrain(
+    map(averageForeground, FOREGROUND_THRESHOLD * 0.5, FOREGROUND_STRONG_THRESHOLD * 0.92, 0, 1),
     0,
     1
   );
-  const denseBody = constrain(
-    lerp(body, constrain(map(neighborForeground, FOREGROUND_THRESHOLD * 0.75, FOREGROUND_STRONG_THRESHOLD, 0, 1), 0, 1), BODY_NEIGHBOR_BLEND),
+  const bodyPeak = constrain(
+    map(localForeground, FOREGROUND_THRESHOLD * 0.9, FOREGROUND_STRONG_THRESHOLD, 0, 1),
     0,
     1
   );
-  const fillBody = constrain(denseBody * BODY_FILL_STRENGTH + localForeground * 0.28, 0, 1);
+  const fillBody = constrain(
+    bodyMass * BODY_FILL_STRENGTH +
+    bodyPeak * 0.45 +
+    coherence * (BODY_COHERENCE_BOOST + 0.12) +
+    strongCore * 0.18,
+    0,
+    1
+  );
   pointData.lastBrightness = brightness;
 
   const alpha = constrain(50 + fillBody * 205, 0, 255);

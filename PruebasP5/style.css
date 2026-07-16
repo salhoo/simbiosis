@@ -37,6 +37,85 @@ canvas {
   z-index: 10;
 }
 
+#boot-panel {
+  width: min(560px, 92vw);
+  display: grid;
+  gap: 1rem;
+}
+
+#boot-title,
+#boot-steps,
+#boot-status {
+  margin: 0;
+}
+
+#boot-title {
+  font-size: clamp(1rem, 1.8vw, 1.3rem);
+  line-height: 1.4;
+}
+
+#boot-steps {
+  font-size: 0.78rem;
+  letter-spacing: 0.12em;
+  color: rgba(244, 247, 251, 0.72);
+}
+
+#boot-status {
+  font-size: 0.9rem;
+  letter-spacing: 0.04em;
+  text-transform: none;
+  color: rgba(244, 247, 251, 0.82);
+}
+
+#boot-controls {
+  display: grid;
+  gap: 0.85rem;
+}
+
+#camera-select,
+#boot-actions button {
+  appearance: none;
+  width: 100%;
+  border: 1px solid rgba(244, 247, 251, 0.22);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  color: #f4f7fb;
+  padding: 0.9rem 1.1rem;
+  font: inherit;
+  letter-spacing: 0.03em;
+}
+
+#camera-select {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+#camera-select option {
+  color: #000;
+}
+
+#boot-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.85rem;
+}
+
+#boot-actions button {
+  cursor: pointer;
+  transition: background 180ms ease, border-color 180ms ease, transform 180ms ease;
+}
+
+#boot-actions button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.16);
+  border-color: rgba(244, 247, 251, 0.35);
+  transform: translateY(-1px);
+}
+
+#boot-actions button:disabled,
+#camera-select:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 body.running #boot-message {
   opacity: 0;
   visibility: hidden;
